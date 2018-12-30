@@ -3,28 +3,53 @@
 #include <Windows.h>
 #include "opencv2/highgui/highgui.hpp"
 #include "opencv2/imgproc/imgproc.hpp"
-//#include "SerialPort.h"
-
 #include <string>
 #include <sstream>
+#include <atlstr.h>
 
 using namespace cv;
 using namespace std;
 
+bool InitCommport(string sendData){				//initialize commport function here.
 
+	HANDLE handler;					//windows.h library functions. read more on windows.h to use functions.			
+	DCB dcb;
+	DWORD byteswritten;
+	bool checkVal = true;
+	CString data;
+	handler = CreateFile("\\\\.\\COM5",		//change commport based on arduino commport
+		GENERIC_READ | GENERIC_WRITE,
+		0, NULL,
+		OPEN_EXISTING,
+		0,
+		NULL);
 
-//char port[] = "\\\\.\\COM3";
-//char output[MAX_DATA_LENGTH];
-//char incoming[MAX_DATA_LENGTH];
+	if (!GetCommState(handler, &dcb)) {
+		return false;
+	}
+	else {
+		dcb.BaudRate = CBR_115200;
+		dcb.ByteSize = 8;
+		dcb.Parity = NOPARITY;
+		dcb.StopBits = ONESTOPBIT;
+	}
+
+	if (!SetCommState(handler, &dcb)) {
+		return false;
+	}
+
+	for (size_t i = 0; i < sendData.length(); i++) {
+		data = sendData.at(i);
+			WriteFile(handler, data, 1, &byteswritten, NULL);
+	}
+	CloseHandle(handler);
+		return checkVal;
+}
+
 
 
 int main(int argc, char** argv) {
-
-	//SerialPort arduino(port);
-	//if (arduino.isConnected()) {
-	//	cout << "port connection achieved" << endl;
-	//}
-
+	
 	VideoCapture cap(0); //capture the video from web cam
 
 	if (!cap.isOpened())  // if not success, exit program
@@ -44,7 +69,7 @@ int main(int argc, char** argv) {
 	int iLowV = 0;
 	int iHighV = 255;
 
-	//Create trackbars in "Control" window
+	
 	cvCreateTrackbar("LowH", "Control", &iLowH, 179); //Hue (0 - 179)  
 	cvCreateTrackbar("HighH", "Control", &iHighH, 179);
 
@@ -54,7 +79,7 @@ int main(int argc, char** argv) {
 	cvCreateTrackbar("LowV", "Control", &iLowV, 255); //Value (0 - 255)
 	cvCreateTrackbar("HighV", "Control", &iHighV, 255);
 
-	//while (arduino.isConnected()) {
+	
 		while (true)
 		{
 			Mat imgOriginal;
@@ -97,41 +122,24 @@ int main(int argc, char** argv) {
 			Moments omoment = moments(imgThresholded);                         //compute moments
 
 			Point p(omoment.m10 / omoment.m00, omoment.m01 / omoment.m00);    //m10 =  dx axis, m01 = dy axis, m00 = dArea
-
-			int xcoord = (omoment.m10 / omoment.m00);
+			
+			int xcoord = (omoment.m10 / omoment.m00);	///obtain xcoordinates of the ball  
 			cout << xcoord << endl; //print out coordiantes
 			circle(imgThresholded, p, 5, Scalar(128, 0, 0), -1);
-
+			
 			imshow("Thresholded Image", imgThresholded); //show the thresholded image
-			//string XCOORD;
-			//cin >> XCOORD;
 
-			//stringstream ss;                                         //num2str bascially
-			//ss << xcoord << endl;									//converts coordintaes to a string value
-			//string XCOORD = ss.str();								//define XCOORD to be a string of the coordinates	
-			
-
-			//char *Xcoord = new char[XCOORD.size() + 1];		//dynamic memory alocation to store the string
-			//copy(XCOORD.begin(), XCOORD.end(), Xcoord);   //copies XCOORD and puts into Xcoord
-			//Xcoord[XCOORD.size()] = '\n';						//add delimiter at the end of array
-
-			//arduino.writeSerialPort(Xcoord, MAX_DATA_LENGTH);	// pass the string to arduino.
-			//arduino.readSerialPort(output, MAX_DATA_LENGTH);    //read the string from arduino.
-			
-
-			//cout << output;
-			//delete[] Xcoord;	//delete memory
-
+			stringstream ss;												//instatiate stringstream
+			ss << (int)xcoord << " " << endl;								//converts coordintaes to a string value
+			string Xcoordinate = ss.str();								//define XCOORD to be a string of the coordinates	
+			InitCommport(Xcoordinate);		//send commport xcoordinates
+			ss.str("");
 
 			if (waitKey(30) == 27) //wait for 'esc' key press for 30ms. If 'esc' key is pressed, break loop
 			{
 				cout << "esc key is pressed by user" << endl;
 				break;
 			}
-
-
-
-		//}
-	}
+		}
 	
 }
