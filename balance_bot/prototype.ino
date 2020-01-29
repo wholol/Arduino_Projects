@@ -1,183 +1,211 @@
-#include <Wire.h>
-#include <SoftwareSerial.h>
+#include <PID_v1.h>
+#include "I2Cdev.h"
+#include "MPU6050_6Axis_MotionApps20.h"
+
+#if I2CDEV_IMPLEMENTATION == I2CDEV_ARDUINO_WIRE
+    #include "Wire.h"
+#endif
 
 
-// MPU 6050 variable setup//
-double accelX, accelY, accelZ,accAngleX, accAngleY;
-double now, lastTime, SampleTime;
-double roll,pitch,yaw;
-double gyroX, gyroY, gyroZ,gyroAngleX,gyroAngleY;
-double accErrorX, accErrorY, GyroErrorX, GyroErrorY, GyroErrorZ;
-int counter = 0;
+MPU6050 mpu;
 
-//DC motor variable setup
-const int IN1 = 7;
-const int IN2 = 6;
-const int IN3 = 5;
-const int IN4 = 4;
-const int ENB = 3;
-const int ENA = 9;
+// MPU control/status vars
+bool dmpReady = false;  // set true if DMP init was successful
+uint8_t mpuIntStatus;   // holds actual interrupt status byte from MPU
+uint8_t devStatus;      // return status after each device operation (0 = success, !0 = error)
+uint16_t packetSize;    // expected DMP packet size (default is 42 bytes)
+uint16_t fifoCount;     // count of all bytes currently in FIFO
+uint8_t fifoBuffer[64]; // FIFO storage buffer
 
-double LastError = 0, TotalError = 0;   //PID variables
+// orientation/motion vars
+Quaternion q;           // [w, x, y, z]         quaternion container
+VectorFloat gravity;    // [x, y, z]            gravity vector
+float ypr[3];           // [yaw, pitch, roll]   yaw/pitch/roll container and gravity vector
 
-void setup() {
-  Serial.begin(9600);
-  pinMode(ENB,OUTPUT);
-  pinMode(ENA,OUTPUT);
-  pinMode(IN1,OUTPUT);
-  pinMode(IN2,OUTPUT);
-  pinMode(IN3,OUTPUT);
-  pinMode(IN4,OUTPUT);
-  Wire.begin();
-  Wire.beginTransmission(0x68); //initialize MPU6050 I2C
-  Wire.write(0x6B);             //register 6B
-  Wire.write(0x00);             //reset register
-  Wire.endTransmission();       //end the transmission
-  compute_errors();             //computes gyro errors to compensate for angles (zero error).
-  delay(20);
-  
-  SoftwareSerial Overflow_Check(A4,A5);  //checks for overflows for MPU 6050.
-  Overflow_Check.begin(9600);
-   if (Overflow_Check.overflow()) {
-     Serial.println("SoftwareSerial overflow!"); }
-    else{
-      Serial.println("no ovf"); 
-      }
+//PID
+double setpoint = 176.3 ;
+double movingAngleOffset = 0.1;
+double input, output;
+double Kp= 24  ;
+double Kd = 1.6;
+double Ki = 96 ;
+PID pid(&input, &output, &setpoint, Kp, Ki, Kd, DIRECT);
+
+
+//MOTOR CONTROLLER
+int ENA = 9;
+int IN1 = 7;
+int IN2 = 8;
+int IN3 = 11;
+int IN4 = 12;
+int ENB = 10;
+
+
+//timers
+long time1Hz = 0;
+long time5Hz = 0;
+
+volatile bool mpuInterrupt = false;     // indicates whether MPU interrupt pin has gone high
+void dmpDataReady()
+{
+    mpuInterrupt = true;
 }
 
-void recordAccelData() {
-  Wire.beginTransmission(0x68); //I2C address of the MPU
-  Wire.write(0x3B); //Starting register for Accel Readings
-  Wire.endTransmission();
-  Wire.requestFrom(0x68,6,true); //Request Accel Registers (3B - 40) for all x,y, and  axis.
-  while(Wire.available() < 6);
-  //dividing 16384 for a sensitivity of 2g.//
-  accelX = (Wire.read()<<8|Wire.read()) /16384.0 ; //accel in X value.
-  accelY = (Wire.read()<<8|Wire.read()) / 16384.0; //accel in Y value.
-  accelZ = (Wire.read()<<8|Wire.read()) / 16384.0 ; //accel in Z value.
-  accAngleX = (atan(accelY / sqrt(pow(accelX,2) + pow( accelZ,2)))*180/PI) - 0.45;    //compute accelerometer in roll
-  accAngleY = (atan(-1* accelX / sqrt(pow(accelY,2) + pow( accelZ,2)))*180/PI) - 2.17;  //compute accelerometer in yaw
+
+void setup()
+{
+    // join I2C bus (I2Cdev library doesn't do this automatically)
+    #if I2CDEV_IMPLEMENTATION == I2CDEV_ARDUINO_WIRE
+        Wire.begin();
+        TWBR = 24; // 400kHz I2C clock (200kHz if CPU is 8MHz)
+    #elif I2CDEV_IMPLEMENTATION == I2CDEV_BUILTIN_FASTWIRE
+        Fastwire::setup(400, true);
+    #endif
+
+    // initialize serial communication
+    // (115200 chosen because it is required for Teapot Demo output, but it's
+    // really up to you depending on your project)
+    Serial.begin(115200);
+    while (!Serial); // wait for Leonardo enumeration, others continue immediately
+
+    // initialize device
+    Serial.println(F("Initializing I2C devices..."));
+    mpu.initialize();
+
+    // verify connection
+    Serial.println(F("Testing device connections..."));
+    Serial.println(mpu.testConnection() ? F("MPU6050 connection successful") : F("MPU6050 connection failed"));
+
+    // load and configure the DMP
+    Serial.println(F("Initializing DMP..."));
+    devStatus = mpu.dmpInitialize();
+
+    // gyro offset calibration
+    mpu.setXGyroOffset(220);
+    mpu.setYGyroOffset(76);
+    mpu.setZGyroOffset(-85);
+    mpu.setZAccelOffset(1788); 
+
+    // make sure it worked (returns 0 if so)
+    if (devStatus == 0)
+    {
+        // turn on the DMP, now that it's ready
+        Serial.println(F("Enabling DMP..."));
+        mpu.setDMPEnabled(true);
+
+        // enable Arduino interrupt detection
+        Serial.println(F("Enabling interrupt detection (Arduino external interrupt 0)..."));
+        attachInterrupt(0, dmpDataReady, RISING);
+        mpuIntStatus = mpu.getIntStatus();
+
+        // set our DMP Ready flag so the main loop() function knows it's okay to use it
+        Serial.println(F("DMP ready! Waiting for first interrupt..."));
+        dmpReady = true;
+
+        // get expected DMP packet size for later comparison
+        packetSize = mpu.dmpGetFIFOPacketSize();
+        
+        //setup PID
+        
+        pid.SetMode(AUTOMATIC);
+        pid.SetSampleTime(10);
+        pid.SetOutputLimits(-255, 255);  
+    }
+    else
+    {
+        // ERROR!
+        // 1 = initial memory load failed
+        // 2 = DMP configuration updates failed
+        // (if it's going to break, usually the code will be 1)
+        Serial.print(F("DMP Initialization failed (code "));
+        Serial.print(devStatus);
+        Serial.println(F(")"));
+    }
 }
 
-void recordGyroData() {
-  
-  Wire.beginTransmission(0b1101000); //I2C address of the MPU
-  Wire.write(0x43); //Starting register for Gyro Readings
-  Wire.endTransmission();
-  Wire.requestFrom(0b1101000,6); //Request Gyro Registers (43 - 48)
-  while(Wire.available() < 6);
-  //divide by 131 with a sensitity of 250 deg/s
-  gyroX = (Wire.read()<<8|Wire.read()) / 131.0; //Store first two bytes into accelX
-  gyroY = (Wire.read()<<8|Wire.read()) / 131.0; //Store middle two bytes into accelY
-  gyroZ = (Wire.read()<<8|Wire.read()) / 131.0; //Store last two bytes into accelZ
-  gyroX = gyroX - 2.37;   //correct the deg/s values by performing error calcs
-  gyroY = gyroY + 0.70;      //correct the deg/s values by performing error calcs
-  gyroZ = gyroZ + 0.32;   //correct the deg/s values by performing error calcs
+
+void movemotors(int output,int gyroreading){
+ if (output < 0){
+    output = -output;
+
+ /* if (gyroreading >= 175.8 && gyroreading <= 180.5){
+    output = 0;
+  }*/
+    analogWrite(ENA,output);
+    analogWrite(ENB,output);
+    digitalWrite(IN1,LOW);
+    digitalWrite(IN2,HIGH);
+    digitalWrite(IN3,LOW);
+    digitalWrite(IN4,HIGH);
+    }
+else{
+  /*if (gyroreading >= 175.8 && gyroreading <= 180.5){
+    output = 0;
+  }*/
+    analogWrite(ENA,output);
+    analogWrite(ENB,output);
+    digitalWrite(IN1,HIGH);
+    digitalWrite(IN2,LOW);
+    digitalWrite(IN3,HIGH);
+    digitalWrite(IN4,LOW);
+    }
 
 }
 
-void compute_errors(){
-  while (counter < 200){
-     Wire.beginTransmission(0x68);
-    Wire.write(0x3B);
-    Wire.endTransmission(false);
-    Wire.requestFrom(0x68, 6, true);
-    accelX = (Wire.read() << 8 | Wire.read()) / 16384.0 ;
-    accelY = (Wire.read() << 8 | Wire.read()) / 16384.0 ;
-    accelZ = (Wire.read() << 8 | Wire.read()) / 16384.0 ;
-    // Sum all readings
-    accErrorX = accErrorX + ((atan((accelY) / sqrt(pow((accelX), 2) + pow((accelZ), 2))) * 180 / PI));
-    accErrorY = accErrorY + ((atan(-1 * (accelX) / sqrt(pow((accelY), 2) + pow((accelZ), 2))) * 180 / PI));
-    counter++;
-  }
-  //Divide the sum by 200 to get the error value
-  accErrorX = accErrorX / 200;
-  accErrorY = accErrorY / 200;
-  counter = 0;
-  // Read gyro values 400 times
-  while (counter < 200) {
-    Wire.beginTransmission(0x68);
-    Wire.write(0x43);
-    Wire.endTransmission(false);
-    Wire.requestFrom(0x68, 6, true);
-    gyroX = Wire.read() << 8 | Wire.read();
-    gyroY = Wire.read() << 8 | Wire.read();
-    gyroZ = Wire.read() << 8 | Wire.read();
-    // Sum all readings
-    GyroErrorX = GyroErrorX + (gyroX / 131.0);
-    GyroErrorY = GyroErrorY + (gyroY / 131.0);
-    GyroErrorZ = GyroErrorZ + (gyroZ / 131.0);
-    counter++;
-  }
-  //Divide the sum by 200 to get the error value
-  GyroErrorX = GyroErrorX / 200;
-  GyroErrorY = GyroErrorY / 200;
-  GyroErrorZ = GyroErrorZ / 200;
-  // Print the error values on the Serial Monitor
-  Serial.print("AccErrorX: ");
-  Serial.println(accErrorX);
-  Serial.print("AccErrorY: ");
-  Serial.println(accErrorY);
-  Serial.print("GyroErrorX: ");
-  Serial.println(GyroErrorX);
-  Serial.print("GyroErrorY: ");
-  Serial.println(GyroErrorY);
-  Serial.print("GyroErrorZ: ");
-  Serial.println(GyroErrorZ);
-}
+void loop()
+{
+    // if programming failed, don't try to do anything
+    if (!dmpReady) return;
 
-class PID_controller{
-  private:
-  double Kp; double Ki; double Kd; double setpoint; double PID_SampleTime;
-  public:
+    // wait for MPU interrupt or extra packet(s) available
+    while (!mpuInterrupt && fifoCount < packetSize)
+    {
+        //no mpu data - performing PID calculations and output to motors
+        
+        pid.Compute();
+        movemotors(output,input);
+        
+    }
 
-  PID_controller(double Kp, double Ki,double Kd,double setpoint){
-    this->Kp = Kp;
-    this->Ki = Ki;
-    this->Kd = Kd;
-    this->setpoint;
-  }
+    // reset interrupt flag and get INT_STATUS byte
+    mpuInterrupt = false;
+    mpuIntStatus = mpu.getIntStatus();
 
-  double Error(double &currentVal){
-    return (currentVal - setpoint);
-  }
+    // get current FIFO count
+    fifoCount = mpu.getFIFOCount();
 
-  double Proportional(double &error){
-    return (Kp*error);
-  }
+    // check for overflow (this should never happen unless our code is too inefficient)
+    if ((mpuIntStatus & 0x10) || fifoCount == 1024)
+    {
+        // reset so we can continue cleanly
+        mpu.resetFIFO();
+        Serial.println(F("FIFO overflow!"));
 
-  double Intergral(double &error){
-    return Ki*(TotalError += error);
-  }
+    // otherwise, check for DMP data ready interrupt (this should happen frequently)
+    }
+    else if (mpuIntStatus & 0x02)
+    {
+        // wait for correct available data length, should be a VERY short wait
+        while (fifoCount < packetSize) fifoCount = mpu.getFIFOCount();
 
-  double Derivative(double &error){
-    return Kd*(error - LastError);
-  }
+        // read a packet from FIFO
+        mpu.getFIFOBytes(fifoBuffer, packetSize);
+        
+        // track FIFO count here in case there is > 1 packet available
+        // (this lets us immediately read more without waiting for an interrupt)
+        fifoCount -= packetSize;
 
-  double Output(double P, double I, double D){
-    return (P + I + D);
-  }
-  
-};
-void loop() {
-  recordAccelData();
-  lastTime = now;
-  now = millis();
-  SampleTime = (now - lastTime)/1000;
-  recordGyroData();
-  gyroAngleX = gyroAngleX + gyroX*SampleTime;
-  gyroAngleY = gyroAngleY + gyroY*SampleTime;
-  roll = 0.96 * gyroAngleX + 0.04 * accAngleX;
-  pitch = 0.96 * gyroAngleY + 0.04 * accAngleY;
-  /*Serial.print(roll);
-  Serial.print("///");
-  Serial.print(pitch);
-  Serial.println(" ");*/
-  PID_controller pid(50,0,0,0.00);
-  double error = pid.Error(pitch);
-  double P = pid.Proportional(error);
-  double I = pid.Intergral(error);
-  double D = pid.Derivative(error);
-  double Output = pid.Output(P,I,D);
-  Serial.println(Output);
+        mpu.dmpGetQuaternion(&q, fifoBuffer);
+        mpu.dmpGetGravity(&gravity, &q);
+        mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
+       
+            Serial.print("ypr\t");
+            Serial.print(ypr[0] * 180/M_PI);
+            Serial.print("\t");
+            Serial.print(ypr[1] * 180/M_PI + 180);
+            Serial.print("\t");
+            Serial.println(ypr[2] * 180/M_PI);
+       
+        input = ypr[1] * 180/M_PI + 180;
+   }
 }
